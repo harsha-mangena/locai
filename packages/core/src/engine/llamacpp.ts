@@ -98,6 +98,7 @@ export class LlamaCppEngine implements InferenceEngine {
       "--cache-type-v", plan.params.kvCacheType,
       "-fa", "on", // flash attention where available
       "--no-webui",
+      "--no-ui",
     ];
 
     this.proc = spawn(this.opts.serverBin, args, { stdio: ["ignore", "pipe", "pipe"] });
