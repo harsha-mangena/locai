@@ -1,0 +1,20 @@
+{
+  "name": "@locai/core",
+  "version": "0.1.0",
+  "description": "LocAI core: device profiler, auto-quant selector, engine-abstraction layer, and backend router.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./profiler": "./src/profiler/index.ts",
+    "./planner": "./src/planner/index.ts",
+    "./engine": "./src/engine/index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test src/**/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
