@@ -73,13 +73,31 @@ export function totalRuntimeBytes(
  * Decode is memory-BANDWIDTH-bound: each token streams ~all weights once.
  *   tok/s ≈ (effectiveBandwidthGBs * 1e9 * efficiency) / weightBytes
  *
- * We apply a backend efficiency factor and a thermal derate.
+ * ...BUT that formula is only valid when the weights actually live in the
+ * backend's fast memory (VRAM for discrete GPUs, usable unified RAM for Apple
+ * Silicon / CPU). If they don't, you fall off the DECODE CLIFF:
+ *
+ *   Generating one token requires reading ALL weights once. If the weights do
+ *   not fit in fast memory, then for EVERY token the OS evicts and re-reads the
+ *   overflow from flash/SSD. Flash is ~10-50x slower than RAM and these are
+ *   random reads. Throughput collapses as a STEP FUNCTION to ~0.1-0.5 tok/s.
+ *
+ * So this function models three regimes against `fastMemoryBytes` (the bytes the
+ * chosen backend can hold at full speed):
+ *   1. in-memory   : total footprint fits comfortably → bandwidth-bound (fast)
+ *   2. thrash zone  : weights fit but KV+activations spill → partial paging, steep derate
+ *   3. over-cliff   : weights alone exceed fast memory → flash-streaming floor
+ *
+ * `footprint` (weights+kv+overhead) and `fastMemoryBytes` are required to make
+ * this honest. They are optional only for backward-compat; when omitted we
+ * assume everything fits (legacy behavior).
  */
 export function tokensPerSecEstimate(
   model: ModelDescriptor,
   quant: QuantSpec,
   device: DeviceProfile,
   backend: BackendKind,
+  opts?: { footprintBytes?: number; fastMemoryBytes?: number },
 ): number {
   const weights = weightBytes(model, quant);
   if (weights <= 0) return 0;
@@ -113,6 +131,36 @@ export function tokensPerSecEstimate(
 
   // Sub-4-bit i-quants have slower kernels (codebook lookups) — small penalty.
   if (quant.bitsPerWeight < 4 && quant.family === "gguf") tps *= 0.85;
+
+  // ---- DECODE CLIFF MODEL -------------------------------------------------
+  const fast = opts?.fastMemoryBytes;
+  const footprint = opts?.footprintBytes ?? weights;
+  if (fast && fast > 0) {
+    if (weights > fast) {
+      // Over the cliff: weights alone don't fit → every token streams the
+      // overflow from flash. Model the flash-bound floor directly. The bigger
+      // the overflow fraction, the closer to the pathological 0.1 tok/s floor.
+      const overflowFrac = Math.min(1, (weights - fast) / weights); // 0..1
+      // Flash random-read effective bandwidth ~ 0.5-2 GB/s; only the overflow
+      // pays it, the resident part still runs at RAM speed. Harmonic blend.
+      const FLASH_GBs = 1.2;
+      const residentFrac = 1 - overflowFrac;
+      const effectiveGBs =
+        1 / (residentFrac / (bandwidthGBs * efficiency) + overflowFrac / FLASH_GBs);
+      tps = (effectiveGBs * 1e9) / weights;
+      return Math.max(0.1, Math.round(tps * 100) / 100);
+    }
+    if (footprint > fast) {
+      // Thrash zone: weights fit, but KV-cache + activations push the working
+      // set past fast memory. The OS pages the hottest non-weight data each
+      // step. Not a full cliff, but a steep, accelerating derate as we approach
+      // the ceiling. Scale derate by how far over we are (capped).
+      const over = Math.min(1, (footprint - fast) / fast); // 0..1
+      const derate = 1 - Math.min(0.85, over * 3); // up to -85%
+      tps *= Math.max(0.15, derate);
+    }
+  }
+  // -------------------------------------------------------------------------
 
   return Math.max(0.1, Math.round(tps * 10) / 10);
 }

@@ -177,6 +177,16 @@ export interface RunPlan {
     score: number;
     /** Quality retention (0..1) of the chosen quant. */
     qualityRetention: number;
+    /**
+     * Honest fit classification against the backend's fast memory:
+     *   "comfortable" — fits with headroom, bandwidth-bound speed
+     *   "tight"       — fits but near the ceiling; KV growth is risky
+     *   "thrash"      — working set spills past fast memory; paging derates speed
+     *   "over-cliff"  — weights exceed fast memory; flash-streaming, unusable
+     * The planner refuses to RETURN thrash/over-cliff as `best`, but exposes the
+     * class so the UI can explain *why* a bigger model was rejected.
+     */
+    fitClass: "comfortable" | "tight" | "thrash" | "over-cliff";
   };
   /** Why the planner chose this — human-readable, surfaced in UI. */
   rationale: string[];

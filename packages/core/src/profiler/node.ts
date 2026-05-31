@@ -180,16 +180,78 @@ function detectAccelerators(
 
 /**
  * The OS will not let one process use all physical RAM. We reserve headroom for
- * the OS, other apps, and (critically on mobile) jetsam/thermal limits.
+ * the OS, other apps, and (critically on mobile) the jetsam/LMK per-app budget.
+ *
+ * The single most important correction over a naive `totalRam * k` heuristic:
+ * on mobile the binding constraint is NOT total RAM, it is the per-app memory
+ * limit the OS enforces before it kills you (iOS jetsam, Android low-memory
+ * killer). That limit does not scale linearly with RAM — it is a tiered budget.
+ * A 6 GB iPhone may terminate an app around ~2.5-3 GB resident even though
+ * "6 GB" is on the box. Modeling THAT is the profiler's whole job.
+ *
+ * Numbers below are conservative priors from field measurements of jetsam
+ * limits and Android per-app heap/RSS ceilings; `platform` lets us tighten iOS
+ * (hard jetsam) vs Android (softer, but background pressure kills fast).
  */
-function estimateUsableRam(totalRam: number, thermallyConstrained: boolean): number {
-  if (thermallyConstrained) {
-    // Mobile/fanless: assume an aggressive per-app budget.
-    return Math.floor(totalRam * 0.45);
+const GiB_ = 1024 ** 3;
+
+export function estimateUsableRam(
+  totalRam: number,
+  thermallyConstrained: boolean,
+  platform: Platform,
+): number {
+  if (platform === "ios" || platform === "android") {
+    return mobileJetsamBudget(totalRam, platform);
   }
+
+  if (thermallyConstrained) {
+    // Fanless non-phone (e.g. some tablets/mini-PCs): aggressive but not as
+    // hard-capped as a phone. Reserve ~40%.
+    return Math.floor(totalRam * 0.55);
+  }
+
   // Desktop/laptop: reserve ~3GB or 20%, whichever is larger, for the system.
-  const reserve = Math.max(3 * 1024 ** 3, totalRam * 0.2);
+  const reserve = Math.max(3 * GiB_, totalRam * 0.2);
   return Math.max(0, Math.floor(totalRam - reserve));
+}
+
+/**
+ * Mobile per-app budget under jetsam (iOS) / LMK (Android).
+ *
+ * This is a TIERED model, not a linear fraction — that is the entire point.
+ * The fraction of total RAM an app can safely hold SHRINKS as device RAM grows,
+ * because the OS reserves an increasing absolute amount for itself, the
+ * foreground compositor, and other apps, and because higher-RAM devices run
+ * heavier OS versions. We encode measured-ish breakpoints.
+ *
+ * Returns the bytes a well-entitled foreground inference app can hold resident
+ * with low risk of jetsam during sustained generation (which is itself a memory
+ * AND thermal stressor, so we stay conservative).
+ */
+function mobileJetsamBudget(totalRam: number, platform: Platform): number {
+  const gib = totalRam / GiB_;
+
+  // Per-tier safe resident budget in GiB. iOS jetsam is the harder wall; we
+  // give iOS slightly less than Android at the same RAM because jetsam
+  // termination is abrupt and unrecoverable mid-generation.
+  // Tiers chosen around common device RAM sizes (2/3/4/6/8/12/16 GB).
+  let budgetGiB: number;
+  if (gib <= 2) budgetGiB = 0.9;
+  else if (gib <= 3) budgetGiB = 1.38;
+  else if (gib <= 4) budgetGiB = 1.9;
+  else if (gib <= 6) budgetGiB = 2.6;
+  else if (gib <= 8) budgetGiB = 3.2;
+  else if (gib <= 12) budgetGiB = 4.3;
+  else if (gib <= 16) budgetGiB = 5.2;
+  else budgetGiB = gib * 0.3; // very high-RAM tablets
+
+  // Android tends to allow a touch more headroom for a foreground service with
+  // largeHeap, but background app pressure can reclaim it fast. Net: ~+10%.
+  if (platform === "android") budgetGiB *= 1.1;
+
+  // Never exceed a sane fraction of total (guards the tiny-device edge).
+  const cap = gib * 0.7;
+  return Math.floor(Math.min(budgetGiB, cap) * GiB_);
 }
 
 function detectThermalConstraint(platform: Platform): boolean {
@@ -255,7 +317,7 @@ export function profileDevice(): DeviceProfile {
     platform,
     arch,
     totalRamBytes: totalRam,
-    usableRamBytes: estimateUsableRam(totalRam, thermallyConstrained),
+    usableRamBytes: estimateUsableRam(totalRam, thermallyConstrained, platform),
     cpu: {
       brand,
       physicalCores,

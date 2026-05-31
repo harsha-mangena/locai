@@ -37,7 +37,7 @@ function printPlan(p: RunPlan, tag: string) {
   for (const r of p.rationale) console.log("    " + r);
   console.log(`\n    weights   ${fmt(p.predicted.weightsBytes)}`);
   console.log(`    kv cache  ${fmt(p.predicted.kvCacheBytes)} (${p.params.kvCacheType}, ctx ${p.params.contextLength})`);
-  console.log(`    total     ${fmt(p.predicted.totalRuntimeBytes)}  ·  pressure ${(p.predicted.memoryPressure * 100).toFixed(0)}%`);
+  console.log(`    total     ${fmt(p.predicted.totalRuntimeBytes)}  ·  pressure ${(p.predicted.memoryPressure * 100).toFixed(0)}%  ·  fit ${p.predicted.fitClass}`);
   console.log(`    speed     ~${p.predicted.tokensPerSecEstimate} tok/s`);
   console.log(`    quality   ${(p.predicted.qualityRetention * 100).toFixed(0)}% retained  ·  score ${p.predicted.score.toFixed(3)}`);
   console.log(`    gpu       ${p.params.gpuLayers === "all" ? "all layers offloaded" : p.params.gpuLayers + " layers"}  ·  threads ${p.params.threads}  ·  spec-decode ${p.params.speculative ? "on" : "off"}`);

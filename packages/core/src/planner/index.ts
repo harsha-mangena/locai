@@ -15,6 +15,7 @@ import type {
   ModelDescriptor,
   QuantSpec,
   DeviceProfile,
+  BackendKind,
 } from "../types.ts";
 import {
   totalRuntimeBytes,
@@ -39,6 +40,42 @@ interface Candidate {
 
 const DEFAULT_MAX_PRESSURE = 0.8;
 const MIN_USABLE_TPS = 2.0; // below this, generation feels broken
+
+/**
+ * Fast memory available to the chosen backend, in bytes — the ceiling weights
+ * must fit under to avoid the decode cliff.
+ *
+ *  - Discrete GPU (cuda/rocm/vulkan/sycl with its own VRAM): the card's VRAM.
+ *    Spilling past VRAM means streaming weights over PCIe each token → cliff.
+ *  - Unified memory (Apple metal) or CPU: the device's usable RAM budget.
+ *
+ * This is what makes "fits and stays fast" a checkable claim instead of a hope.
+ */
+function fastMemoryBytes(
+  device: DeviceProfile,
+  backend: BackendKind,
+  accelerator: { memoryBytes?: number; unifiedMemory?: boolean },
+): number {
+  if (backend === "cpu") return device.usableRamBytes;
+  if (accelerator.unifiedMemory) return device.usableRamBytes;
+  // Discrete VRAM. Reserve ~10% for the framework/context on the card.
+  if (accelerator.memoryBytes && accelerator.memoryBytes > 0) {
+    return Math.floor(accelerator.memoryBytes * 0.9);
+  }
+  // Unknown discrete VRAM → fall back to usable RAM (conservative).
+  return device.usableRamBytes;
+}
+
+function classifyFit(
+  weights: number,
+  footprint: number,
+  fast: number,
+): "comfortable" | "tight" | "thrash" | "over-cliff" {
+  if (weights > fast) return "over-cliff";
+  if (footprint > fast) return "thrash";
+  if (footprint > fast * 0.85) return "tight";
+  return "comfortable";
+}
 
 /**
  * Build a RunPlan for one (model, quant) on this device, or null if infeasible.
@@ -71,8 +108,23 @@ function buildPlan(
   // 4. Hard feasibility gate: must fit under the pressure ceiling.
   if (memoryPressure > maxPressure) return null;
 
-  // 5. Predict speed.
-  const tps = tokensPerSecEstimate(model, quant, device, backend);
+  // 4b. DECODE-CLIFF GATE — the honesty fix.
+  //
+  // memoryPressure is measured against usable RAM, but the thing that actually
+  // determines whether decode stays fast is whether the working set fits in the
+  // BACKEND'S fast memory (VRAM for discrete GPUs; usable RAM for unified/CPU).
+  // Classify the fit and refuse to ship a plan that would thrash or fall off
+  // the cliff — better to auto-downgrade to a smaller model/quant than to hand
+  // the user a 0.3 tok/s experience that "technically fit."
+  const fast = fastMemoryBytes(device, backend, accelerator);
+  const fitClass = classifyFit(sized.weights, sized.total, fast);
+  if (fitClass === "over-cliff" || fitClass === "thrash") return null;
+
+  // 5. Predict speed — now cliff-aware (passes footprint + fast-memory ceiling).
+  const tps = tokensPerSecEstimate(model, quant, device, backend, {
+    footprintBytes: sized.total,
+    fastMemoryBytes: fast,
+  });
   if (tps < MIN_USABLE_TPS) return null;
 
   // 6. Quality.
@@ -87,7 +139,16 @@ function buildPlan(
 
   // 8. Composite score: weighted by user goal.
   const goal = pref?.goal ?? "balanced";
-  const fit = 1 - memoryPressure; // more headroom = safer
+  // Fit is a SATURATING SAFETY term, not a "reward empty RAM" term. Below the
+  // cliff, more headroom barely matters — a comfortable 58%-pressure plan is not
+  // meaningfully riskier than a 26% one, and treating it as such sabotages the
+  // core thesis (a bigger model that still fits should win on quality). So we
+  // give near-full fit credit while comfortable and only punish as the working
+  // set approaches the fast-memory ceiling (tight → thrash).
+  //   headroom = how far the footprint is below the fast-memory ceiling.
+  const headroom = Math.max(0, 1 - sized.total / fast); // 0..1
+  // Map headroom through a curve that saturates: ≥30% headroom ≈ full credit.
+  const fit = Math.min(1, headroom / 0.3);
   const speedNorm = Math.min(1, tps / 40); // 40 tok/s ~= "fast" ceiling
   const weights =
     goal === "quality"
@@ -130,6 +191,12 @@ function buildPlan(
     rationale.push(`KV cache quantized to ${kvType} to fit the chosen context (${contextLength} tokens).`);
   if (model.gqa) rationale.push("Model uses grouped-query attention → compact KV cache.");
   rationale.push(`Estimated ~${tps.toFixed(0)} tokens/sec decode.`);
+  if (fitClass === "tight")
+    rationale.push(
+      "Working set is near the fast-memory ceiling — context growth is constrained to stay off the paging cliff.",
+    );
+  else
+    rationale.push("Weights + KV cache fit in fast memory with headroom — decode stays bandwidth-bound (no flash paging).");
   rationale.push(`Quality retention ~${(qualityRetention * 100).toFixed(0)}% vs full precision.`);
   if (speculative) rationale.push("Speculative decoding enabled (memory headroom available).");
 
@@ -146,6 +213,7 @@ function buildPlan(
       tokensPerSecEstimate: tps,
       score,
       qualityRetention,
+      fitClass,
     },
     rationale,
     confidence,
