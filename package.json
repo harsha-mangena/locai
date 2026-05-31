@@ -12,7 +12,9 @@
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "profile": "node --experimental-strip-types packages/core/src/cli/profile.ts",
-    "plan": "node --experimental-strip-types packages/core/src/cli/plan.ts"
+    "plan": "node --experimental-strip-types packages/core/src/cli/plan.ts",
+    "run:chat": "node --experimental-strip-types packages/core/src/cli/run.ts",
+    "serve": "node --experimental-strip-types packages/core/src/cli/serve.ts"
   },
   "engines": {
     "node": ">=22"
