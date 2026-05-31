@@ -8,3 +8,4 @@ dist/
 *.safetensors
 models/
 .cache/
+vendor/
