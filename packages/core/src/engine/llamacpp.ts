@@ -134,9 +134,14 @@ export class LlamaCppEngine implements InferenceEngine {
 
     const body = {
       prompt: params.prompt,
-      n_predict: params.maxTokens ?? 512,
+      // -1 = no artificial limit; model stops at its own stop tokens or context ceiling.
+      // Only set a limit when the caller explicitly requests one.
+      n_predict: params.maxTokens ?? -1,
       temperature: params.temperature ?? 0.7,
       top_p: params.topP ?? 0.95,
+      top_k: params.topK ?? 40,
+      min_p: params.minP ?? 0.0,
+      repeat_penalty: params.repeatPenalty ?? 1.1,
       stop: params.stop ?? [],
       stream: true,
     };

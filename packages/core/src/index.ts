@@ -4,7 +4,9 @@
 export * from "./types.ts";
 export { profileDevice } from "./profiler/index.ts";
 export { plan } from "./planner/index.ts";
+export { selectStrategy, assessFlashBacked, detectSystemModel } from "./planner/strategy.ts";
 export { SEED_CATALOG } from "./catalog/seed.ts";
+export { ModelHub } from "./catalog/hub.ts";
 export {
   EngineRouter,
   type InferenceEngine,

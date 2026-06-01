@@ -14,7 +14,9 @@
     "profile": "node --experimental-strip-types packages/core/src/cli/profile.ts",
     "plan": "node --experimental-strip-types packages/core/src/cli/plan.ts",
     "run:chat": "node --experimental-strip-types packages/core/src/cli/run.ts",
-    "serve": "node --experimental-strip-types packages/core/src/cli/serve.ts"
+    "serve": "node --experimental-strip-types packages/core/src/cli/serve.ts",
+    "dev:dashboard": "npm run dev --workspace=packages/dashboard",
+    "build:dashboard": "npm run build --workspace=packages/dashboard"
   },
   "engines": {
     "node": ">=22"
