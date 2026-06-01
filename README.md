@@ -91,7 +91,7 @@ It correctly prefers a *bigger-but-quantized* model over a *small-but-precise* o
 ┌──────────────────────────────────────────────────────────────────┐
 │  UX LAYER   Desktop (Tauri) · Mobile (native) · Web (PWA/WebGPU) │
 ├──────────────────────────────────────────────────────────────────┤
-│  STRATEGY CASCADE   Tier 0 → Tier 1 → Tier 2 → … → Tier 5       │ ← the real moat
+│  STRATEGY CASCADE   Tier 0 → Tier 1 → Tier 2 → … → Tier 5        │ ← the real moat
 │  Device Profiler → Strategy Selector → Model Hub                 │
 │  Auto-Quant Planner · OpenAI-compat Server · RAG                 │
 ├──────────────────────────────────────────────────────────────────┤
