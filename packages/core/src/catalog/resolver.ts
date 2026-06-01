@@ -21,10 +21,17 @@ export function conventionalFilename(model: ModelDescriptor, quant: QuantSpec): 
   return `${model.id}-${q}.gguf`;
 }
 
+function normalizeKey(value: string): string {
+  return value.replace(/[^a-z0-9]+/gi, "").toLowerCase();
+}
+
 /**
- * Find a GGUF for this (model, quant). Strategy:
+ * Find a GGUF for this exact (model, quant). Strategy:
  *  1. exact conventional filename
- *  2. any file whose name contains the model id (quant-agnostic fallback)
+ *  2. flexible filename match that must contain BOTH model id and quant id
+ *
+ * The second branch intentionally stays quant-aware. A Q4 file must never make
+ * the hub report Q6/Q8 as ready; that breaks the planner's core promise.
  */
 export function resolveModel(
   model: ModelDescriptor,
@@ -35,11 +42,12 @@ export function resolveModel(
   if (fs.existsSync(exact)) return { path: exact, exists: true };
 
   if (fs.existsSync(modelsDir)) {
-    const idKey = model.id.replace(/[^a-z0-9]+/gi, "").toLowerCase();
+    const idKey = normalizeKey(model.id);
+    const quantKey = normalizeKey(quant.id);
     for (const f of fs.readdirSync(modelsDir)) {
       if (!f.toLowerCase().endsWith(".gguf")) continue;
-      const norm = f.replace(/[^a-z0-9]+/gi, "").toLowerCase();
-      if (norm.includes(idKey) || idKey.includes(norm.slice(0, 12))) {
+      const norm = normalizeKey(f);
+      if (norm.includes(idKey) && norm.includes(quantKey)) {
         return { path: path.join(modelsDir, f), exists: true };
       }
     }

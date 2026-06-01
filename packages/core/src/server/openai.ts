@@ -17,16 +17,22 @@
  */
 
 import http from "node:http";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { LocAI } from "../runtime/locai.ts";
 import { profileDevice } from "../profiler/index.ts";
+import { buildDownloadPlan } from "../planner/strategy.ts";
 import type { ChatMessage } from "../engine/chat-template.ts";
 import { ToolRegistry } from "../tools/registry.ts";
+import type { OpenAITool, ToolDefinition } from "../tools/registry.ts";
 import { makeWebSearchTool } from "../tools/web-search.ts";
+import { makeCodingTools } from "../tools/coding.ts";
 import {
   runAgenticLoop,
   type ChatMessage as AgenticChatMessage,
   type ModelResponse,
 } from "./agentic.ts";
+import { parseModelToolResponse, toEngineMessages } from "./tool-calling.ts";
 
 export interface ServeOptions {
   port?: number;
@@ -38,7 +44,23 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Expose-Headers": "X-LocAI-Task-Id",
 };
+
+interface AgentTaskState {
+  id: string;
+  abortController: AbortController;
+  startedAt: number;
+  pendingApprovals: Map<string, (decision: ApprovalDecision) => void>;
+  alwaysApprovedTools: Set<string>;
+}
+
+const activeAgentTasks = new Map<string, AgentTaskState>();
+
+interface ApprovalDecision {
+  approved: boolean;
+  always?: boolean;
+}
 
 function send(res: http.ServerResponse, code: number, obj: unknown) {
   const body = JSON.stringify(obj);
@@ -53,6 +75,176 @@ function readBody(req: http.IncomingMessage): Promise<string> {
     req.on("end", () => resolve(data));
     req.on("error", reject);
   });
+}
+
+function writeSse(res: http.ServerResponse, event: string, data?: unknown) {
+  res.write(`event: ${event}\n`);
+  if (data !== undefined) {
+    res.write(`data: ${JSON.stringify(data)}\n`);
+  }
+  res.write("\n");
+}
+
+function truncateText(value: string, max = 8_000): string {
+  if (value.length <= max) return value;
+  return value.slice(0, max) + `\n...[truncated ${value.length - max} chars]`;
+}
+
+function resolveProjectPath(projectRoot: string, input: unknown): string {
+  const root = path.resolve(projectRoot);
+  const requested = String(input ?? ".");
+  const resolved = path.resolve(root, requested);
+  const relative = path.relative(root, resolved);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`Path escapes project root: ${requested}`);
+  }
+  return resolved;
+}
+
+async function buildApprovalPreview(
+  projectRoot: string,
+  toolName: string,
+  args: Record<string, unknown>,
+): Promise<{ summary: string; targetPath?: string; diff?: string }> {
+  if (toolName === "shell_exec") {
+    return {
+      summary: `Run shell command: ${String(args.command ?? "")}`,
+    };
+  }
+
+  if (toolName === "file_write") {
+    const fs = await import("node:fs/promises");
+    const target = resolveProjectPath(projectRoot, args.path);
+    const relative = path.relative(projectRoot, target);
+    const next = String(args.content ?? "");
+    let previous = "";
+    try {
+      previous = await fs.readFile(target, "utf8");
+    } catch {
+      previous = "";
+    }
+
+    const diff = [
+      `--- ${relative || "."}`,
+      `+++ ${relative || "."}`,
+      "@@",
+      ...previous.split("\n").slice(0, 200).map((line) => `-${line}`),
+      ...next.split("\n").slice(0, 200).map((line) => `+${line}`),
+    ].join("\n");
+
+    return {
+      summary: `Write ${relative || "."}`,
+      targetPath: relative,
+      diff: truncateText(diff),
+    };
+  }
+
+  return { summary: `Approve ${toolName}` };
+}
+
+function registerCodingToolsWithApproval(opts: {
+  registry: ToolRegistry;
+  projectRoot: string;
+  task: AgentTaskState;
+  res: http.ServerResponse;
+  allowDangerousTools: boolean;
+  interactiveApprovals: boolean;
+}): ToolDefinition[] {
+  const safeTools = makeCodingTools({
+    projectRoot: opts.projectRoot,
+    allowDangerousTools: false,
+  });
+  const dangerousTools = makeCodingTools({
+    projectRoot: opts.projectRoot,
+    allowDangerousTools: true,
+  });
+  const dangerousByName = new Map(dangerousTools.map((tool) => [tool.name, tool]));
+  const registered: ToolDefinition[] = [];
+
+  for (const tool of safeTools) {
+    const isDangerous = tool.name === "file_write" || tool.name === "shell_exec";
+    let registeredTool = tool;
+
+    if (isDangerous && opts.interactiveApprovals) {
+      const executable = dangerousByName.get(tool.name) ?? tool;
+      registeredTool = {
+        ...tool,
+        async execute(args) {
+          if (opts.task.alwaysApprovedTools.has(tool.name)) {
+            return executable.execute(args);
+          }
+
+          const actionId = randomUUID();
+          const preview = await buildApprovalPreview(opts.projectRoot, tool.name, args);
+          const decision = await new Promise<ApprovalDecision>((resolve) => {
+            opts.task.pendingApprovals.set(actionId, resolve);
+            writeSse(opts.res, "approval_required", {
+              taskId: opts.task.id,
+              actionId,
+              toolName: tool.name,
+              args,
+              ...preview,
+            });
+          });
+
+          opts.task.pendingApprovals.delete(actionId);
+          if (decision.always) opts.task.alwaysApprovedTools.add(tool.name);
+          if (!decision.approved) {
+            return JSON.stringify({
+              error: "permission_denied",
+              tool: tool.name,
+              message: "User denied this action.",
+            });
+          }
+
+          return executable.execute(args);
+        },
+      };
+    } else if (isDangerous && opts.allowDangerousTools) {
+      registeredTool = dangerousByName.get(tool.name) ?? tool;
+    }
+
+    opts.registry.register(registeredTool);
+    registered.push(registeredTool);
+  }
+
+  return registered;
+}
+
+async function callLocalModel(
+  ai: LocAI,
+  messages: AgenticChatMessage[],
+  tools: OpenAITool[],
+  opts: {
+    maxTokens?: number;
+    temperature?: number;
+    systemPrompt?: string;
+    signal?: AbortSignal;
+  } = {},
+): Promise<ModelResponse> {
+  if (opts.signal?.aborted) throw new Error("agent task aborted");
+
+  const chatMessages = tools.length > 0
+    ? toEngineMessages(messages, tools, opts.systemPrompt)
+    : messages
+      .filter((m) => m.role !== "tool")
+      .map((m) => ({
+        role: m.role as ChatMessage["role"],
+        content: m.content ?? "",
+      }));
+
+  let content = "";
+  for await (const token of ai.chat(chatMessages, {
+    maxTokens: opts.maxTokens,
+    temperature: opts.temperature,
+  })) {
+    if (opts.signal?.aborted) throw new Error("agent task aborted");
+    content += token;
+  }
+
+  return tools.length > 0
+    ? parseModelToolResponse(content, tools)
+    : { content, tool_calls: undefined };
 }
 
 export async function serve(opts: ServeOptions): Promise<http.Server> {
@@ -130,16 +322,8 @@ export async function serve(opts: ServeOptions): Promise<http.Server> {
           return send(res, 404, { error: { message: `quant '${reqQuantId}' not found for model '${reqModelId}'`, type: "not_found" } });
         }
 
-        // Start the download — we need a DownloadPlan. Construct a minimal one.
-        // The hub.download() requires a DownloadPlan with a URL. For the MVP,
-        // we construct a HuggingFace URL convention.
-        const downloadUrl = `https://huggingface.co/${reqModelId}/resolve/main/${reqModelId}-${reqQuantId.toLowerCase()}.gguf`;
-        hub.download(match.model, match.quant, {
-          url: downloadUrl,
-          sizeBytes: match.sizeBytes,
-          resumable: true,
-          wifiOnly: false,
-        });
+        const downloadPlan = buildDownloadPlan(match.model, match.quant, device);
+        hub.download(match.model, match.quant, downloadPlan);
 
         return send(res, 200, { status: "started" });
       }
@@ -163,6 +347,201 @@ export async function serve(opts: ServeOptions): Promise<http.Server> {
 
           hub.evict(match.model, match.quant);
           return send(res, 200, { status: "deleted" });
+        }
+      }
+
+      if (req.method === "POST" && url.pathname === "/locai/agent/stop") {
+        const raw = await readBody(req);
+        const body = JSON.parse(raw || "{}") as { taskId?: string };
+        if (!body.taskId) {
+          return send(res, 400, { error: { message: "taskId is required", type: "invalid_request_error" } });
+        }
+
+        const task = activeAgentTasks.get(body.taskId);
+        if (!task) {
+          return send(res, 404, { error: { message: `agent task '${body.taskId}' not found`, type: "not_found" } });
+        }
+
+        task.abortController.abort();
+        activeAgentTasks.delete(body.taskId);
+        return send(res, 200, { status: "stopped", taskId: body.taskId });
+      }
+
+      if (req.method === "POST" && url.pathname === "/locai/agent/approve") {
+        const raw = await readBody(req);
+        const body = JSON.parse(raw || "{}") as {
+          taskId?: string;
+          actionId?: string;
+          approved?: boolean;
+          always?: boolean;
+        };
+        if (!body.taskId || !body.actionId) {
+          return send(res, 400, { error: { message: "taskId and actionId are required", type: "invalid_request_error" } });
+        }
+
+        const task = activeAgentTasks.get(body.taskId);
+        const resolve = task?.pendingApprovals.get(body.actionId);
+        if (!task || !resolve) {
+          return send(res, 404, { error: { message: `approval '${body.actionId}' not found`, type: "not_found" } });
+        }
+
+        resolve({ approved: body.approved === true || body.always === true, always: body.always === true });
+        return send(res, 200, {
+          status: body.approved === true || body.always === true ? "approved" : "denied",
+          taskId: body.taskId,
+          actionId: body.actionId,
+        });
+      }
+
+      if (req.method === "POST" && url.pathname === "/locai/agent/run") {
+        const raw = await readBody(req);
+        const body = JSON.parse(raw || "{}") as {
+          task?: string;
+          tools?: string[];
+          projectRoot?: string;
+          maxIterations?: number;
+          max_tokens?: number;
+          temperature?: number;
+          systemPrompt?: string;
+          autoApprove?: boolean;
+          approvalMode?: "read-only" | "interactive" | "allow-dangerous";
+          allowDangerousTools?: boolean;
+        };
+
+        if (!body.task || !body.task.trim()) {
+          return send(res, 400, { error: { message: "task is required", type: "invalid_request_error" } });
+        }
+
+        const taskId = randomUUID();
+        const abortController = new AbortController();
+        activeAgentTasks.set(taskId, {
+          id: taskId,
+          abortController,
+          startedAt: Date.now(),
+          pendingApprovals: new Map(),
+          alwaysApprovedTools: new Set(),
+        });
+        const task = activeAgentTasks.get(taskId)!;
+
+        const projectRoot = path.resolve(body.projectRoot ?? process.cwd());
+        const allowDangerousTools =
+          body.allowDangerousTools === true ||
+          body.autoApprove === true ||
+          body.approvalMode === "allow-dangerous";
+        const interactiveApprovals = body.approvalMode === "interactive" && !allowDangerousTools;
+
+        const registry = new ToolRegistry();
+        registry.register(makeWebSearchTool());
+        registerCodingToolsWithApproval({
+          registry,
+          projectRoot,
+          task,
+          res,
+          allowDangerousTools,
+          interactiveApprovals,
+        });
+
+        const requestedNames = body.tools?.length
+          ? body.tools
+          : registry.list();
+        const requestedTools = requestedNames
+          .map((name) => registry.get(name))
+          .filter((tool) => tool !== null);
+
+        const systemPrompt = [
+          body.systemPrompt,
+          `Project root: ${projectRoot}`,
+          allowDangerousTools
+            ? "Dangerous tools are explicitly enabled for this trusted local run."
+            : "Dangerous tools are disabled. Read/search first and propose edits instead of writing files or running shell commands.",
+        ].filter(Boolean).join("\n\n");
+
+        res.writeHead(200, {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache",
+          connection: "keep-alive",
+          "X-LocAI-Task-Id": taskId,
+          ...CORS_HEADERS,
+        });
+
+        res.on("close", () => {
+          abortController.abort();
+          for (const resolve of task.pendingApprovals.values()) {
+            resolve({ approved: false });
+          }
+          activeAgentTasks.delete(taskId);
+        });
+
+        writeSse(res, "task_started", {
+          taskId,
+          projectRoot,
+          tools: requestedTools.map((tool) => tool.name),
+          dangerousToolsEnabled: allowDangerousTools,
+          interactiveApprovals,
+        });
+
+        const started = Date.now();
+        let finalAnswer = "";
+        let toolCalls = 0;
+
+        try {
+          const callModel = async (
+            agenticMessages: AgenticChatMessage[],
+            openAITools: OpenAITool[],
+          ): Promise<ModelResponse> => callLocalModel(ai, agenticMessages, openAITools, {
+            maxTokens: body.max_tokens,
+            temperature: body.temperature,
+            systemPrompt,
+            signal: abortController.signal,
+          });
+
+          const loop = runAgenticLoop(
+            [{ role: "user", content: body.task }],
+            requestedTools,
+            registry,
+            callModel,
+            { maxIterations: body.maxIterations },
+          );
+
+          for await (const event of loop) {
+            if (abortController.signal.aborted) break;
+
+            if (event.event === "token") {
+              const tokenData = event.data as { content: string; stop: boolean };
+              if (!tokenData.stop) finalAnswer += tokenData.content;
+            } else if (event.event === "tool_call") {
+              toolCalls++;
+            }
+
+            if (event.event === "done") {
+              writeSse(res, "done", {
+                taskId,
+                finalAnswer,
+                iterations: toolCalls,
+                elapsedMs: Date.now() - started,
+              });
+            } else {
+              writeSse(res, event.event, event.data);
+            }
+          }
+        } catch (error) {
+          writeSse(res, "error", {
+            taskId,
+            message: error instanceof Error ? error.message : String(error),
+            recoverable: false,
+          });
+          writeSse(res, "done", {
+            taskId,
+            finalAnswer,
+            iterations: toolCalls,
+            elapsedMs: Date.now() - started,
+          });
+        } finally {
+          for (const resolve of task.pendingApprovals.values()) {
+            resolve({ approved: false });
+          }
+          activeAgentTasks.delete(taskId);
+          return res.end();
         }
       }
 
@@ -194,30 +573,14 @@ export async function serve(opts: ServeOptions): Promise<http.Server> {
             .map((t) => toolRegistry.get(t.function.name))
             .filter((t) => t !== null);
 
-          // Build a callModel callback that uses ai.chat() to call the model
           const callModel = async (
             agenticMessages: AgenticChatMessage[],
-            _tools: unknown
+            openAITools: OpenAITool[]
           ): Promise<ModelResponse> => {
-            // Convert agentic messages to ChatMessage format for ai.chat()
-            const chatMessages: ChatMessage[] = agenticMessages.map((m) => ({
-              role: m.role as ChatMessage["role"],
-              content: m.content ?? "",
-            }));
-
-            // Accumulate the full response from the model
-            let content = "";
-            for await (const token of ai.chat(chatMessages, {
+            return callLocalModel(ai, agenticMessages, openAITools, {
               maxTokens: reqJson.max_tokens,
               temperature: reqJson.temperature,
-            })) {
-              content += token;
-            }
-
-            // For now, the local model doesn't natively produce tool_calls in its output.
-            // In a full implementation, we'd parse the model's structured output for tool calls.
-            // Return the content as a final answer (no tool_calls).
-            return { content, tool_calls: undefined };
+            });
           };
 
           if (reqJson.stream) {
