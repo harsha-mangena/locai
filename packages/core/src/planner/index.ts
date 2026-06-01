@@ -91,8 +91,13 @@ function buildPlan(
   if (!backendChoice) return null;
   const { backend, accelerator } = backendChoice;
 
-  // 2. Determine context length (respect request, cap to model max).
-  const wantContext = pref?.minContext ?? Math.min(8192, model.contextLength);
+  // 2. Determine context length.
+  // If the caller specified a minimum, honour it (capped to model max).
+  // Otherwise use the model's full context length — don't silently cap it.
+  // The KV-cache sizing below will handle memory pressure automatically.
+  const wantContext = pref?.minContext && pref.minContext > 0
+    ? pref.minContext
+    : model.contextLength;
   const contextLength = Math.min(wantContext, model.contextLength);
 
   // 3. Size memory at f16 KV first, then downgrade KV type under pressure.

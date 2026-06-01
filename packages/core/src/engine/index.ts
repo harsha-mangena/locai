@@ -14,9 +14,12 @@ import type { RunPlan, BackendKind } from "../types.ts";
 
 export interface GenerateParams {
   prompt: string;
-  maxTokens?: number;
+  maxTokens?: number;       // undefined = no limit (model decides via stop tokens)
   temperature?: number;
   topP?: number;
+  topK?: number;            // top-k sampling (reasoning models use lower values)
+  minP?: number;            // min-p sampling (Qwen3 recommended: 0.01)
+  repeatPenalty?: number;
   stop?: string[];
 }
 
