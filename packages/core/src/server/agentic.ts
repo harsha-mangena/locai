@@ -81,8 +81,16 @@ export async function* runAgenticLoop(
     return;
   }
 
-  // Build OpenAI tools format from the provided tool definitions
-  const openAITools = registry.toOpenAITools();
+  // Build OpenAI tools format from the provided tool definitions, preserving
+  // the caller's allow-list instead of exposing every registered tool.
+  const openAITools: OpenAITool[] = tools.map((def) => ({
+    type: "function",
+    function: {
+      name: def.name,
+      description: def.description,
+      parameters: def.parameters,
+    },
+  }));
   const executor = new ToolExecutor(registry);
 
   let iteration = 0;
@@ -111,6 +119,14 @@ export async function* runAgenticLoop(
           },
         };
       }
+
+      // Append the assistant message before tool results so the transcript
+      // follows OpenAI's order: assistant(tool_calls) -> tool(result).
+      messages.push({
+        role: "assistant",
+        content: response.content,
+        tool_calls: response.tool_calls,
+      });
 
       // Execute each tool call sequentially and yield results
       for (const toolCall of response.tool_calls) {
@@ -144,13 +160,6 @@ export async function* runAgenticLoop(
           tool_call_id: toolCall.id,
         });
       }
-
-      // Append the assistant message with tool_calls
-      messages.push({
-        role: "assistant",
-        content: response.content,
-        tool_calls: response.tool_calls,
-      });
 
       iteration++;
 

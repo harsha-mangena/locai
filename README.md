@@ -4,7 +4,7 @@
 
 **The universal, open-source, zero-config local AI runtime.**
 
-Run powerful LLMs fully locally on any device — phone, tablet, laptop, desktop, browser, edge — with zero cloud dependency. Open the app; it detects your hardware, picks the right model and strategy automatically, and runs it at the best speed your silicon allows.
+Run powerful LLMs fully locally on any device — phone, tablet, laptop, desktop, browser, edge — with zero cloud dependency. Open the app or CLI; it detects your hardware, picks the right model and strategy automatically, and runs it at the best speed your silicon allows.
 
 `Apache-2.0` · fully offline · fully auditable
 
@@ -72,16 +72,34 @@ The magic is not the inference — llama.cpp already does that. The magic is the
 Once a model is local, the planner enumerates every `(model × quant)` candidate, prices out memory (weights + KV cache, GQA-aware), predicts decode speed (bandwidth-bound model with decode-cliff detection), scores quality × fit × speed against your goal, and returns the optimal plan:
 
 ```
-★ BEST: Llama 3.2 3B Instruct · Q6_K · metal
-  Using Llama 3.2 3B Instruct (3.2B) at Q6_K (6.6 bpw).
+★ BEST: Llama 3.2 3B Instruct · Q4_K_M · metal
+  Using Llama 3.2 3B Instruct (3.2B) at Q4_K_M (4.9 bpw, imatrix).
   Apple M1 Pro GPU via metal (unified memory).
-  Fits in 3.8 GiB of 12.8 GiB usable RAM (30% pressure).
+  Fits in 5.8 GiB of 12.8 GiB usable RAM (45% pressure).
+  KV cache quantized to q4_0 to fit the chosen context.
   Model uses grouped-query attention → compact KV cache.
-  Estimated ~49 tokens/sec decode.
-  Quality retention ~100% vs full precision.
+  Estimated ~66 tokens/sec decode.
+  Quality retention ~98% vs full precision.
 ```
 
 It correctly prefers a *bigger-but-quantized* model over a *small-but-precise* one when that wins — but **won't waste your RAM on an aggressive 2-bit quant when a 4-bit one fits easily.**
+
+---
+
+## Local agent CLI
+
+LocAI includes an alpha **Claude Code-like local CLI** called `lai`.
+
+It is designed for the local-first developer workflow:
+
+- profile the machine and run the selected local model through the LocAI server
+- stream agent progress through SSE
+- let the model call local tools such as `file_read`, `grep_search`, `git_status`, `git_diff`, and `web_fetch`
+- pause for per-action approval before destructive tools (`file_write`, `shell_exec`)
+- support `always approve` for repeated trusted actions during a session
+- work against the same OpenAI-compatible local runtime used by the dashboard
+
+The CLI works locally today and covers the core Claude Code-like loop: prompt, inspect files, call tools, ask before dangerous actions, stream progress, and keep a local transcript. It is still early: multi-file patch review and the dashboard agent tab are next.
 
 ---
 
@@ -93,7 +111,7 @@ It correctly prefers a *bigger-but-quantized* model over a *small-but-precise* o
 ├──────────────────────────────────────────────────────────────────┤
 │  STRATEGY CASCADE   Tier 0 → Tier 1 → Tier 2 → … → Tier 5       │ ← the real moat
 │  Device Profiler → Strategy Selector → Model Hub                 │
-│  Auto-Quant Planner · OpenAI-compat Server · RAG                 │
+│  Auto-Quant Planner · OpenAI-compat Server · Local Agent Tools   │
 ├──────────────────────────────────────────────────────────────────┤
 │  ENGINE ABSTRACTION   load / generate(stream) / unload           │
 │  System Model Engine · LlamaCpp Engine · Flash Engine            │
@@ -127,6 +145,35 @@ npm run plan -- --goal balanced --context 16384
 npm test --workspaces
 ```
 
+### Run the local server
+
+The server exposes `/v1/chat/completions` plus LocAI-specific planning, model hub, and agent endpoints.
+
+```bash
+# Requires a GGUF model in ./models and a built llama-server binary.
+npm run serve
+```
+
+### Use the Claude Code-like local CLI
+
+In another terminal:
+
+```bash
+# One-shot local task, read-only tools by default
+npm run start --workspace=packages/cli -- "inspect this repo and summarize the architecture"
+
+# Interactive REPL
+npm run start --workspace=packages/cli
+
+# Trusted local run with file_write and shell_exec enabled
+npm run start --workspace=packages/cli -- --allow-dangerous "update README with the new CLI workflow"
+
+# Read-only mode: never write files or run shell commands
+npm run start --workspace=packages/cli -- --read-only "review this repo"
+```
+
+By default, `lai` uses interactive approvals for destructive actions. Use `--allow-dangerous` only for trusted local runs.
+
 ---
 
 ## Status
@@ -135,13 +182,22 @@ npm test --workspaces
 |---|---|
 | Device profiler (Node) | ✅ reads real CPU/RAM/SIMD/accelerators |
 | Auto-quant planner | ✅ memory + speed + quality model, goal-weighted, tested |
+| Exact model/quant resolver | ✅ local availability must match model + quant |
 | Strategy cascade (Tier 0–5) | ✅ selector + tests |
 | Engine-abstraction interface + router | ✅ contract defined |
 | Seed model catalog (GGUF) | ✅ 1.5B → 14B, real arch dims |
-| Model Hub (download + storage mgmt) | ✅ resumable HTTP, LRU eviction |
+| Model Hub (download + storage mgmt) | ✅ resumable HTTP, redirect handling, LRU eviction |
 | Flash-backed viability model | ✅ DRAM-Flash physics, tested |
 | llama.cpp engine binding | ✅ process-backed (llama-server) |
 | OpenAI-compatible server | ✅ streaming + non-streaming |
+| Local tool-call bridge | ✅ structured local protocol + parser |
+| Agent endpoint | ✅ `/locai/agent/run` SSE + `/locai/agent/approve` + `/locai/agent/stop` |
+| Local coding tools | ✅ read/search/git/web tools; write/shell gated |
+| Agent SDK | ✅ SSE consumer + typed events |
+| `lai` local CLI | ✅ Claude Code-like REPL + one-shot tasks + sessions |
+| Interactive approval queue | ✅ terminal approval flow |
+| Dashboard chat | ✅ streaming UI + planning/device/model panels |
+| Dashboard agent tab | 🔜 |
 | System model engine (iOS Foundation Models) | 🔜 platform bridge needed |
 | System model engine (Android AICore) | 🔜 platform bridge needed |
 | Browser WASM engine (wllama) | 🔜 |

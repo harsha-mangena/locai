@@ -1,0 +1,25 @@
+{
+  "name": "@locai/cli",
+  "version": "0.1.0",
+  "description": "LocAI CLI — the `lai` terminal-native agentic coding assistant.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "bin": {
+    "lai": "./src/index.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test 'src/**/*.test.ts'",
+    "start": "node --experimental-strip-types src/index.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@locai/agent": "*",
+    "@locai/core": "*"
+  }
+}

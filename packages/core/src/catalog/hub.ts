@@ -91,15 +91,15 @@ class NodeDownloadBackend implements DownloadBackend {
     let req: http.ClientRequest | null = null;
 
     const promise = new Promise<string>((resolve, reject) => {
-      const doDownload = (resumeFrom = 0) => {
-        const parsed = new URL(url);
+      const doDownload = (resumeFrom = 0, currentUrl = url) => {
+        const parsed = new URL(currentUrl);
         const proto = parsed.protocol === "https:" ? https : http;
         const headers: Record<string, string> = {};
         if (resumeFrom > 0 && opts.resumable) {
           headers["Range"] = `bytes=${resumeFrom}-`;
         }
 
-        req = proto.get(url, { headers }, (res) => {
+        req = proto.get(currentUrl, { headers }, (res) => {
           if (cancelled) return reject(new Error("cancelled"));
 
           // Follow redirects (HuggingFace uses 302).
@@ -107,9 +107,8 @@ class NodeDownloadBackend implements DownloadBackend {
             const location = res.headers.location;
             if (location) {
               req = null;
-              doDownload(resumeFrom);
-              // Re-issue with the redirect URL — simplified: just retry same URL
-              // In production, follow the Location header properly.
+              const nextUrl = new URL(location, currentUrl).toString();
+              doDownload(resumeFrom, nextUrl);
               return;
             }
           }
@@ -118,13 +117,16 @@ class NodeDownloadBackend implements DownloadBackend {
             return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
           }
 
-          const totalBytes = resumeFrom + Number(
-            res.headers["content-length"] ?? res.headers["content-range"]?.split("/")[1] ?? 0,
-          );
+          const serverAcceptedRange = resumeFrom > 0 && res.statusCode === 206;
+          const contentLength = Number(res.headers["content-length"] ?? 0);
+          const rangeTotal = Number(res.headers["content-range"]?.split("/")[1] ?? 0);
+          const totalBytes = serverAcceptedRange
+            ? (rangeTotal || resumeFrom + contentLength)
+            : contentLength;
 
-          const flags = resumeFrom > 0 ? "a" : "w";
+          const flags = serverAcceptedRange ? "a" : "w";
           const dest = fs.createWriteStream(destPath, { flags });
-          let received = resumeFrom;
+          let received = serverAcceptedRange ? resumeFrom : 0;
           const startTime = Date.now();
 
           res.on("data", (chunk: Buffer) => {
@@ -168,10 +170,11 @@ class NodeDownloadBackend implements DownloadBackend {
         req.on("error", reject);
       };
 
-      // Check for partial download to resume.
+      // Check for partial download to resume. `destPath` is the .part path
+      // provided by ModelHub.download().
       let resumeFrom = 0;
-      if (opts.resumable && fs.existsSync(destPath + ".part")) {
-        resumeFrom = fs.statSync(destPath + ".part").size;
+      if (opts.resumable && fs.existsSync(destPath)) {
+        resumeFrom = fs.statSync(destPath).size;
       }
       doDownload(resumeFrom);
     });

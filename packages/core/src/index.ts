@@ -7,6 +7,19 @@ export { plan } from "./planner/index.ts";
 export { selectStrategy, assessFlashBacked, detectSystemModel } from "./planner/strategy.ts";
 export { SEED_CATALOG } from "./catalog/seed.ts";
 export { ModelHub } from "./catalog/hub.ts";
+export { ToolRegistry } from "./tools/registry.ts";
+export { ToolExecutor } from "./tools/executor.ts";
+export {
+  makeCodingTools,
+  registerCodingTools,
+  makeFileReadTool,
+  makeFileWriteTool,
+  makeShellExecTool,
+  makeGrepSearchTool,
+  makeGitStatusTool,
+  makeGitDiffTool,
+  makeWebFetchTool,
+} from "./tools/coding.ts";
 export {
   EngineRouter,
   type InferenceEngine,

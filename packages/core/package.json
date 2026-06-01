@@ -9,7 +9,11 @@
     ".": "./src/index.ts",
     "./profiler": "./src/profiler/index.ts",
     "./planner": "./src/planner/index.ts",
-    "./engine": "./src/engine/index.ts"
+    "./engine": "./src/engine/index.ts",
+    "./tools/registry": "./src/tools/registry.ts",
+    "./tools/executor": "./src/tools/executor.ts",
+    "./tools/coding": "./src/tools/coding.ts",
+    "./browser": "./src/browser.ts"
   },
   "scripts": {
     "test": "node --experimental-strip-types --test 'src/**/*.test.ts'"
